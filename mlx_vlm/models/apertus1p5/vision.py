@@ -3,6 +3,41 @@ import mlx.nn as nn
 
 from .config import VisionTokenizerConfig
 
+# Input elements per convolution tile. MLX conv2d needs about four times its
+# output in scratch memory, so a 3x3 convolution over a full-resolution image
+# (1.96 MP, 256 channels) would take about 9 GB on its own.
+CONV_TILE_ELEMENTS = 1 << 25
+
+
+def tiled_conv2d(conv: nn.Conv2d, hidden_states: mx.array, padding, stride=1):
+    """conv(pad(x)) with padding = (top, bottom, left, right), computed in row
+    tiles for large inputs. Each output row depends only on its own input
+    rows, so the result does not change."""
+    batch, height, width, channels = hidden_states.shape
+    kernel = conv.weight.shape[1]
+    top, bottom, left, right = padding
+
+    def run(tile, pad_top, pad_bottom):
+        tile = mx.pad(tile, ((0, 0), (pad_top, pad_bottom), (left, right), (0, 0)))
+        out = mx.conv2d(tile, conv.weight, stride=stride)
+        return out + conv.bias if "bias" in conv else out
+
+    if batch * height * width * channels <= CONV_TILE_ELEMENTS:
+        return run(hidden_states, top, bottom)
+
+    out_rows = (height + top + bottom - kernel) // stride + 1
+    rows = max(1, CONV_TILE_ELEMENTS // (batch * width * channels * stride))
+    tiles = []
+    for start in range(0, out_rows, rows):
+        stop = min(out_rows, start + rows)
+        first = start * stride - top
+        last = (stop - 1) * stride + kernel - top
+        tile = hidden_states[:, max(0, first) : min(height, last)]
+        tile = run(tile, max(0, -first), max(0, last - height))
+        mx.eval(tile)
+        tiles.append(tile)
+    return mx.concatenate(tiles, axis=1)
+
 
 class ResnetBlock(nn.Module):
     def __init__(
@@ -34,13 +69,17 @@ class ResnetBlock(nn.Module):
         return hidden_states * mx.sigmoid(hidden_states)
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
+        # Evaluate between steps so that only one full-resolution temporary
+        # is alive at a time.
         residual = hidden_states
-        hidden_states = self.conv1(self._silu(self.norm1(hidden_states)))
-        hidden_states = self.norm2(hidden_states)
-        hidden_states = self.dropout(self._silu(hidden_states))
-        hidden_states = self.conv2(hidden_states)
+        hidden_states = self._silu(self.norm1(hidden_states))
+        mx.eval(hidden_states)
+        hidden_states = tiled_conv2d(self.conv1, hidden_states, (1, 1, 1, 1))
+        hidden_states = self.dropout(self._silu(self.norm2(hidden_states)))
+        mx.eval(hidden_states)
+        hidden_states = tiled_conv2d(self.conv2, hidden_states, (1, 1, 1, 1))
         if self.in_channels != self.out_channels:
-            residual = self.nin_shortcut(residual)
+            residual = tiled_conv2d(self.nin_shortcut, residual, (0, 0, 0, 0))
         return residual + hidden_states
 
 
@@ -76,8 +115,8 @@ class Downsample(nn.Module):
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2)
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        hidden_states = mx.pad(hidden_states, ((0, 0), (0, 1), (0, 1), (0, 0)))
-        return self.conv(hidden_states)
+        # Asymmetric right/bottom padding, as in the reference.
+        return tiled_conv2d(self.conv, hidden_states, (0, 1, 0, 1), stride=2)
 
 
 class DownBlock(nn.Module):
@@ -134,21 +173,24 @@ class Encoder(nn.Module):
         )
 
     def __call__(self, pixel_values: mx.array) -> mx.array:
-        hidden_states = self.conv_in(pixel_values)
+        hidden_states = tiled_conv2d(self.conv_in, pixel_values, (1, 1, 1, 1))
+        mx.eval(hidden_states)
         for level, down in enumerate(self.down):
             for block_index, block in enumerate(down.block):
                 hidden_states = block(hidden_states)
                 if down.attn:
                     hidden_states = down.attn[block_index](hidden_states)
+                mx.eval(hidden_states)
             if level != self.num_resolutions - 1:
                 hidden_states = down.downsample(hidden_states)
+                mx.eval(hidden_states)
 
         hidden_states = self.mid.block_1(hidden_states)
         hidden_states = self.mid.attn_1(hidden_states)
         hidden_states = self.mid.block_2(hidden_states)
         hidden_states = self.norm_out(hidden_states)
         hidden_states = hidden_states * mx.sigmoid(hidden_states)
-        return self.conv_out(hidden_states)
+        return tiled_conv2d(self.conv_out, hidden_states, (1, 1, 1, 1))
 
 
 class VectorQuantizer(nn.Module):

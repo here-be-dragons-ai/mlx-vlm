@@ -12843,6 +12843,20 @@ class TestApertus1p5(unittest.TestCase):
         mx.eval(expected, actual)
         self.assertTrue(mx.array_equal(expected, actual).item())
 
+    def test_tiled_vision_convolutions_match_untiled(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models.apertus1p5 import vision
+
+        model = self.apertus1p5.Model(_apertus1p5_tiny_config())
+        pixels = mx.random.uniform(shape=(1, 32, 16, 3), low=-1, high=1)
+        expected = model.vision_tokenizer.encoder(pixels)
+        with patch.object(vision, "CONV_TILE_ELEMENTS", 64):
+            actual = model.vision_tokenizer.encoder(pixels)
+        mx.eval(expected, actual)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+
     def test_image_processor_resize_normalize_and_pad(self):
         from PIL import Image
 
