@@ -150,7 +150,11 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = ApertusModel(args)
         if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+            self.lm_head = nn.Linear(
+                args.hidden_size,
+                args.output_vocab_size or args.vocab_size,
+                bias=False,
+            )
 
     def __call__(
         self,
