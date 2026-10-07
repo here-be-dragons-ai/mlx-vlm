@@ -23,3 +23,5 @@ class ModelConfig(BaseModelConfig):
     tie_word_embeddings: bool
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    # Apertus 1.5 prunes the LM head to the text vocabulary; None = vocab_size.
+    output_vocab_size: Optional[int] = None
