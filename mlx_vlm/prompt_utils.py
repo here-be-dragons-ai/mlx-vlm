@@ -66,6 +66,7 @@ MODEL_CONFIG = {
     "minicpm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral_large4": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "apertus1p5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
