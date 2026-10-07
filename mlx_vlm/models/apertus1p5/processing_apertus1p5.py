@@ -42,6 +42,22 @@ def smart_resize(
     return max(new_height, factor), max(new_width, factor)
 
 
+def _flatten_text(message):
+    """Join the text parts of a non-user message into one string; the Apertus
+    template rejects list content outside user turns."""
+    if not isinstance(message, dict) or message.get("role") == "user":
+        return message
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    text = "".join(
+        p.get("text", "")
+        for p in content
+        if isinstance(p, dict) and p.get("type") == "text"
+    )
+    return {**message, "content": text}
+
+
 class Apertus1p5ImageProcessor:
     def __init__(
         self,
@@ -224,8 +240,12 @@ class Apertus1p5Processor(ProcessorMixin):
         data["attention_mask"] = encoded["attention_mask"]
         return BatchFeature(data=data, tensor_type=return_tensors)
 
-    def apply_chat_template(self, *args, **kwargs):
-        return self.tokenizer.apply_chat_template(*args, **kwargs)
+    def apply_chat_template(self, conversation, *args, **kwargs):
+        # mlx-vlm passes every message as a list of parts; only user turns
+        # may stay that way.
+        if isinstance(conversation, list):
+            conversation = [_flatten_text(m) for m in conversation]
+        return self.tokenizer.apply_chat_template(conversation, *args, **kwargs)
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
