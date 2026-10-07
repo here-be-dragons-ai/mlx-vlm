@@ -2819,6 +2819,7 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
 def should_add_special_tokens(model_type: str, processor) -> bool:
     """Return whether tokenization should add markers outside the chat template."""
     template_owns_markers = {
+        "apertus1p5",
         "gemma3",
         "gemma3n",
         "gemma4",

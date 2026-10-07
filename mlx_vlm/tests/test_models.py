@@ -1502,6 +1502,302 @@ def test_glm_quantized_head_sanitization_loads_strictly():
     model.load_weights(list(model.sanitize(checkpoint | head).items()), strict=True)
 
 
+def apertus1p5_config():
+    """Tiny Apertus 1.5 config in the transformers 5 layout."""
+    from mlx_vlm.models import apertus1p5
+
+    return apertus1p5.ModelConfig.from_dict(
+        {
+            "model_type": "apertus1p5",
+            "image_token_offset": 40,
+            "audio_token_offset": 56,
+            "text_config": {
+                "model_type": "apertus1p5_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "intermediate_size": 128,
+                "mlp_bias": False,
+                "num_attention_heads": 4,
+                "attention_bias": False,
+                "rms_norm_eps": 1e-05,
+                "vocab_size": 64,
+                "output_vocab_size": 40,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 512,
+                "post_norm": False,
+                "qk_norm": True,
+                "tie_word_embeddings": False,
+                "rope_parameters": {
+                    "factor": 32.0,
+                    "high_freq_factor": 4.0,
+                    "low_freq_factor": 1.0,
+                    "original_max_position_embeddings": 64,
+                    "rope_theta": 4000000,
+                    "rope_type": "llama3",
+                },
+            },
+        }
+    )
+
+
+def test_apertus1p5_reads_rope_parameters():
+    text = apertus1p5_config().text_config
+    assert text.rope_theta == 4000000
+    assert text.rope_scaling["rope_type"] == "llama3"
+    assert "rope_theta" not in text.rope_scaling
+
+
+def test_apertus1p5_prunes_lm_head_and_keeps_cache_parity():
+    from mlx_vlm.models import apertus1p5
+
+    model = apertus1p5.Model(apertus1p5_config())
+    mx.eval(model.parameters())
+    # Image codes live above the text vocabulary in the input embeddings.
+    ids = mx.array([[1, 5, 41, 60, 2, 7, 11, 3]])
+    full = model(ids).logits
+    assert full.shape == (1, 8, 40)
+    cache = model.language_model.make_cache()
+    model(ids[:, :-1], cache=cache)
+    last = model(ids[:, -1:], cache=cache).logits
+    np.testing.assert_allclose(
+        np.array(last[0, -1]), np.array(full[0, -1]), atol=1e-4, rtol=1e-4
+    )
+
+
+def test_apertus1p5_sanitize_maps_hf_layout_and_drops_tokenizers():
+    from mlx_vlm.models import apertus1p5
+
+    model = apertus1p5.Model(apertus1p5_config())
+    expected = dict(tree_flatten(model.parameters()))
+    checkpoint = {}
+    for k, v in expected.items():
+        name = k[len("language_model.") :]
+        if name.startswith("model."):
+            name = "model.language_model." + name[len("model.") :]
+        if name.endswith(("alpha_p", "alpha_n")):
+            v = v.reshape(1)
+        checkpoint[name] = v
+    checkpoint["model.vision_tokenizer.quantize.embedding.weight"] = mx.zeros((4, 2))
+    checkpoint["model.audio_tokenizer.head.linear.weight"] = mx.zeros((2, 2))
+
+    sanitized = model.sanitize(checkpoint)
+    assert sanitized.keys() == expected.keys()
+    model.load_weights(list(sanitized.items()), strict=True)
+    # Already converted checkpoints pass through unchanged.
+    assert model.sanitize(sanitized) is sanitized
+
+
+def apertus1p5_vision_config():
+    from mlx_vlm.models.apertus1p5 import VisionTokenizerConfig
+
+    return VisionTokenizerConfig(
+        base_channels=32,
+        channel_multiplier=[1, 2],
+        num_res_blocks=1,
+        attn_resolutions=[16],
+        resolution=32,
+        latent_channels=8,
+        embed_dim=8,
+        codebook_size=16,
+        spatial_scale_factor=2,
+    )
+
+
+def test_apertus1p5_vision_tiling_matches_untiled(monkeypatch):
+    from mlx_vlm.models.apertus1p5 import vision
+
+    mx.random.seed(0)
+    tokenizer = vision.VisionTokenizer(apertus1p5_vision_config())
+    tokenizer.quantize.embedding.weight = mx.random.normal((16, 8))
+    mx.eval(tokenizer.parameters())
+    pixels = mx.random.uniform(-1, 1, (1, 12, 10, 3))
+    whole = tokenizer.encoder(pixels)
+    monkeypatch.setattr(vision, "_TILE_ELEMENTS", 64)
+    tiled = tokenizer.encoder(pixels)
+    assert whole.shape == (1, 6, 5, 8)
+    np.testing.assert_allclose(np.array(tiled), np.array(whole), atol=1e-5)
+    codes = tokenizer.encode(pixels)
+    assert codes.shape == (1, 6, 5) and int(codes.max()) < 16
+
+
+def test_apertus1p5_vision_sanitize_transposes_convolutions():
+    from mlx_vlm.models import apertus1p5
+
+    config = apertus1p5_config()
+    config.vision_tokenizer_config = apertus1p5_vision_config()
+    model = apertus1p5.Model(config)
+    expected = dict(tree_flatten(model.parameters()))
+    checkpoint = {}
+    for k, v in expected.items():
+        if k.startswith("vision_tokenizer."):
+            name = "model." + k
+            if v.ndim == 4:
+                v = v.transpose(0, 3, 1, 2)
+        else:
+            name = k[len("language_model.") :]
+            if name.startswith("model."):
+                name = "model.language_model." + name[len("model.") :]
+            if name.endswith(("alpha_p", "alpha_n")):
+                v = v.reshape(1)
+        checkpoint[name] = v
+    checkpoint["model.audio_tokenizer.head.linear.weight"] = mx.zeros((2, 2))
+    sanitized = model.sanitize(checkpoint)
+    assert sanitized.keys() == expected.keys()
+    for k, v in sanitized.items():
+        assert v.shape == expected[k].shape, k
+    assert model.cast_predicate("language_model.lm_head.weight")
+    assert not model.cast_predicate("vision_tokenizer.quantize.embedding.weight")
+
+
+def test_apertus1p5_image_codes_replace_placeholders():
+    from mlx_vlm.models import apertus1p5
+
+    config = apertus1p5_config()
+    config.vision_tokenizer_config = apertus1p5_vision_config()
+    config.image_token_id = 7
+    model = apertus1p5.Model(config)
+    mx.eval(model.parameters())
+    # A 4x6 image with factor 2 gives a 2x3 grid; padding beyond the true
+    # size must be cropped away.
+    pixels = mx.random.uniform(-1, 1, (1, 3, 6, 8))
+    ids = mx.array([[1, 7, 7, 7, 7, 7, 7, 2]])
+    image_ids = np.array(model._image_ids(pixels, [[4, 6]]))
+    assert image_ids.shape == (6,) and image_ids.min() >= 40  # image_token_offset
+    out = model.get_input_embeddings(ids, pixels, image_sizes=[[4, 6]])
+    expected_ids = mx.array([[1, *image_ids.tolist(), 2]])
+    np.testing.assert_array_equal(
+        np.array(out.inputs_embeds),
+        np.array(model.language_model.model.embed_tokens(expected_ids)),
+    )
+    with pytest.raises(ValueError):
+        model.get_input_embeddings(ids[:, :5], pixels, image_sizes=[[4, 6]])
+
+
+def test_apertus1p5_processor_expands_image_runs():
+    from PIL import Image
+
+    from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+        Apertus1p5ImageProcessor,
+        Apertus1p5Processor,
+        smart_resize,
+    )
+
+    assert smart_resize(480, 640) == (480, 640)
+    assert smart_resize(10, 10) == (256, 256)
+    assert smart_resize(5184, 3456) == (1712, 1136)
+
+    processor = Apertus1p5Processor.__new__(Apertus1p5Processor)
+    processor.image_token = "<|image|>"
+    processor.boi_token, processor.eoi_token = "<|img_start|>", "<|img_end|>"
+    processor.image_wrapper_token = "<|img_token_start|>"
+    processor.eol_token = "<|img_end_of_row|>"
+    assert processor._expand_image(2, 3) == (
+        "<|img_start|>2*3<|img_token_start|>"
+        "<|image|><|image|><|image|><|img_end_of_row|><|image|><|image|><|image|>"
+        "<|img_end|>"
+    )
+    pixels = Apertus1p5ImageProcessor().preprocess(
+        Image.new("RGB", (256, 256), (255, 0, 128))
+    )
+    assert pixels.shape == (3, 256, 256)
+    np.testing.assert_allclose(pixels[:, 0, 0], [1.0, -1.0, 0.5 / 127.5], atol=1e-6)
+
+
+def apertus1p5_audio_config():
+    from mlx_vlm.models.apertus1p5 import AudioTokenizerConfig
+
+    return AudioTokenizerConfig(
+        num_filters=4,
+        upsampling_ratios=[3, 2],
+        hidden_size=8,
+        codebook_size=16,
+        codebook_dim=8,
+        num_lstm_layers=2,
+    )
+
+
+def test_apertus1p5_audio_reflect_pad_matches_numpy():
+    from mlx_vlm.models.apertus1p5.audio import _reflect_pad
+
+    x = np.arange(10, dtype=np.float32).reshape(1, 5, 2)
+    out = np.array(_reflect_pad(mx.array(x), 2, 3))
+    np.testing.assert_array_equal(
+        out, np.pad(x, [(0, 0), (2, 3), (0, 0)], mode="reflect")
+    )
+    # Shorter than the padding: zeros are appended before reflecting.
+    short = np.array([[[1.0], [2.0]]], dtype=np.float32)
+    ref = np.pad(
+        np.pad(short, [(0, 0), (0, 2), (0, 0)]),
+        [(0, 0), (3, 3), (0, 0)],
+        mode="reflect",
+    )
+    np.testing.assert_array_equal(
+        np.array(_reflect_pad(mx.array(short), 3, 3)), ref[:, :-2]
+    )
+
+
+def test_apertus1p5_audio_codes_per_hop_and_sanitize():
+    from mlx_vlm.models.apertus1p5.audio import AudioTokenizer
+
+    tokenizer = AudioTokenizer(apertus1p5_audio_config())
+    assert tokenizer.hop_length == 6
+    params = dict(tree_flatten(tokenizer.parameters()))
+    checkpoint = {"backbone.embed.weight": mx.zeros((2, 2))}
+    for k, v in params.items():
+        if k.endswith(".conv.weight"):
+            # Weight norm: g * v / ||v|| with the PyTorch (out, in, k) layout.
+            prefix = k[: -len("weight")]
+            checkpoint[prefix + "parametrizations.weight.original0"] = mx.full(
+                (v.shape[0], 1, 1), 2.0
+            )
+            checkpoint[prefix + "parametrizations.weight.original1"] = v.transpose(
+                0, 2, 1
+            )
+        elif ".lstm." in k:
+            layer, name = k.split(".lstm.")[1].split(".")
+            if name == "Wx":
+                checkpoint[k.split(".lstm.")[0] + f".lstm.weight_ih_l{layer}"] = v
+            elif name == "Wh":
+                checkpoint[k.split(".lstm.")[0] + f".lstm.weight_hh_l{layer}"] = v
+            else:
+                base = k.split(".lstm.")[0]
+                checkpoint[base + f".lstm.bias_ih_l{layer}"] = v
+                checkpoint[base + f".lstm.bias_hh_l{layer}"] = mx.ones_like(v)
+        else:
+            checkpoint[k] = v
+    checkpoint["quantizer.codebook.embed_avg"] = mx.zeros((16, 8))
+    checkpoint["quantizer.codebook.cluster_size"] = mx.zeros((16,))
+    sanitized = AudioTokenizer.sanitize(checkpoint)
+    assert sanitized.keys() == params.keys()
+    conv = next(k for k in sanitized if k.endswith(".conv.weight"))
+    norms = np.linalg.norm(np.array(sanitized[conv]), axis=(1, 2))
+    np.testing.assert_allclose(norms, 2.0, rtol=1e-5)
+    bias = next(k for k in sanitized if k.endswith(".bias") and ".lstm." in k)
+    np.testing.assert_allclose(np.array(sanitized[bias]), np.array(params[bias]) + 1)
+    tokenizer.load_weights(list(sanitized.items()), strict=True)
+    for samples in (1, 6, 7, 61):
+        codes = tokenizer.encode(mx.random.normal((1, samples)))
+        assert codes.shape == (1, -(-samples // 6)), samples
+
+
+def test_apertus1p5_processor_expands_audio_runs():
+    from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+        Apertus1p5FeatureExtractor,
+        Apertus1p5Processor,
+    )
+
+    fe = Apertus1p5FeatureExtractor()
+    clip = fe.preprocess(np.array([0.0, 0.5, -0.25], dtype=np.float32))
+    np.testing.assert_allclose(np.abs(clip).max(), 10 ** (-3 / 20), rtol=1e-6)
+    assert fe.num_codes(600) == 1 and fe.num_codes(601) == 2
+    runs = ["<|audio_start|>" + "<|audio|>" * 2 + "<|audio_end|>"]
+    assert Apertus1p5Processor._expand(["a<|audio|>b"], "<|audio|>", runs) == [
+        "a" + runs[0] + "b"
+    ]
+    with pytest.raises(ValueError):
+        Apertus1p5Processor._expand(["a"], "<|audio|>", runs)
+
+
 def test_moondream2_sanitize_remaps_checkpoint_layout():
     from mlx_vlm.models.moondream2 import Model
 
